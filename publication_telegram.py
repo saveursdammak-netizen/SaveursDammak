@@ -47,12 +47,14 @@ PAGE_ACCESS_TOKEN = lire_table_supabase("table_token_facebook", "valeur")
 TELEGRAM_BOT_TOKEN = lire_table_supabase("table_telegram_token", "valeur")
 TELEGRAM_CHAT_ID = lire_table_supabase("table_telegram_chat_id", "valeur")
 
+# Récupération dynamique de l'ID de la page Facebook depuis Supabase (table_page_id)
+PAGE_ID = lire_table_supabase("table_page_id", "valeur") or lire_table_supabase("table_page_id", "page_id") or "111157353629841"
+
 PROMPTIX_URL = "https://promptix.tn/api/v1/chat/completions"
 
 MODELE_TEXTE = "google/gemini-3.8-flash"
 MODELE_IMAGE = "google/gemini-3.1-flash-image-preview"
 
-PAGE_ID = "110428155424695"
 GRAPH_URL = f"https://graph.facebook.com/v26.0/{PAGE_ID}/photos"
 BUCKET_NAME = "patisseries"
 FICHIER_RESULTAT = "resultat.png"
