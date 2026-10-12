@@ -5,6 +5,7 @@ import json
 import os
 import random
 import requests
+from datetime import datetime, time
 from PIL import Image
 from supabase import Client, create_client
 from telegram import Bot
@@ -66,6 +67,48 @@ def recuperer_restriction_supabase(nom_table):
             return res.data[0]["contenu"]
     except Exception as e:
         print(f"⚠️ Erreur récupération restriction de {nom_table} : {e}")
+    return ""
+
+
+def verifier_plage_horaire():
+    """Vérifie si l'heure actuelle du serveur est dans la plage horaire définie dans Supabase."""
+    try:
+        res = supabase.table("table_horaires_publication").select("*").limit(1).execute()
+        if res.data:
+            h_debut_str = res.data[0]["heure_debut"]
+            h_fin_str = res.data[0]["heure_fin"]
+
+            h_debut = datetime.strptime(h_debut_str, "%H:%M:%S").time()
+            h_fin = datetime.strptime(h_fin_str, "%H:%M:%S").time()
+
+            maintenant = datetime.now().time()
+
+            est_dans_plage = h_debut <= maintenant <= h_fin
+            print(f"⏰ Plage horaire autorisée : {h_debut} à {h_fin} | Heure actuelle : {maintenant.strftime('%H:%M:%S')}")
+            print(f"📌 Dans l'intervalle ? {'OUI' if est_dans_plage else 'NON'}")
+            return est_dans_plage
+    except Exception as e:
+        print(f"⚠️ Erreur vérification plage horaire : {e}")
+    return True
+
+
+def verifier_reponse_telegram():
+    """Interroge Telegram pour récupérer le dernier ordre 'oui' ou 'non'."""
+    url_updates = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        rep_tg = requests.get(url_updates, timeout=30).json()
+        if rep_tg.get("ok"):
+            resultats = rep_tg.get("result", [])
+            for res in reversed(resultats):
+                message = res.get("message", {})
+                if str(message.get("chat", {}).get("id")) == str(TELEGRAM_CHAT_ID):
+                    texte_msg = message.get("text", "").strip().lower()
+                    if texte_msg in ["oui", "valider"]:
+                        return "oui"
+                    elif texte_msg in ["non", "refuser"]:
+                        return "non"
+    except Exception as e:
+        print(f"⚠️ Erreur lors de la lecture de Telegram : {e}")
     return ""
 
 
@@ -360,8 +403,41 @@ def publier_sur_facebook(texte, image_path):
     return rep_fb.json()
 
 
+def executer_publication_facebook(derniere_action):
+    """Effectue la publication effective sur Facebook et nettoie."""
+    if not os.path.exists(FICHIER_RESULTAT):
+        img_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
+        r = requests.get(img_url)
+        with open(FICHIER_RESULTAT, "wb") as f:
+            f.write(r.content)
+
+    resultat = publier_sur_facebook(derniere_action["texte_genere"], FICHIER_RESULTAT)
+    if "error" not in resultat:
+        post_id = resultat.get("post_id") or resultat.get("id")
+        print(f"🎉 Publication réussie ! ID : {post_id}")
+        supabase.table("historique_publications").update({"statut": "termine"}).eq("id", derniere_action["id"]).execute()
+
+        try:
+            supabase.storage.from_(BUCKET_NAME).remove([derniere_action["image_path"]])
+            print("🧹 Image temporaire supprimée du Storage Supabase.")
+        except Exception:
+            pass
+
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        asyncio.run(
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"🎉 C'est en ligne sur Facebook avec succès ! (ID: {post_id})",
+            )
+        )
+        return True
+    else:
+        print("❌ Échec Facebook :", resultat)
+        return False
+
+
 def main():
-    print("Vérification de l'état dans Supabase...")
+    print("🔍 Récupération de la dernière publication dans Supabase...")
 
     historique = (
         supabase.table("historique_publications")
@@ -375,99 +451,72 @@ def main():
     derniere_action = historique[0] if historique else None
     statut_actuel = derniere_action["statut"] if derniere_action else "termine"
 
-    print(f"📊 Dernier statut trouvé dans Supabase : {statut_actuel}")
+    print(f"📊 Statut actuel trouvé dans Supabase : {statut_actuel}")
 
-    if statut_actuel == "en_attente":
-        print("🔍 Vérification de votre réponse (oui/non) sur Telegram...")
-        url_updates = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        rep_tg = requests.get(url_updates).json()
+    # =========================================================================
+    # 1. SI STATUT EST "annule" OU "termine"
+    # =========================================================================
+    if statut_actuel in ["annule", "termine"]:
+        reponse = verifier_reponse_telegram()
+        print(f"💬 Réponse Telegram détectée : '{reponse}'")
 
-        dernier_texte_recu = ""
-        if rep_tg.get("ok"):
-            resultats = rep_tg.get("result", [])
-            for res in reversed(resultats):
-                message = res.get("message", {})
-                if str(message.get("chat", {}).get("id")) == str(TELEGRAM_CHAT_ID):
-                    texte_msg = message.get("text", "").strip().lower()
-                    if texte_msg in ["oui", "valider"]:
-                        dernier_texte_recu = "oui"
-                        break
-                    elif texte_msg in ["non", "refuser"]:
-                        dernier_texte_recu = "non"
-                        break
+        if reponse == "oui":
+            if verifier_plage_horaire():
+                print("🚀 Dans la plage horaire ! Publication immédiate...")
+                if executer_publication_facebook(derniere_action):
+                    texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
+                    asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+            else:
+                print("⏳ Hors plage horaire. Statut passe à 'valide'.")
+                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
 
-        print(f"💬 Réponse détectée sur Telegram : '{dernier_texte_recu}'")
-
-        if dernier_texte_recu == "oui":
-            print("🚀 'oui' détecté ! Passage à 'valide' et publication immédiate...")
-            statut_actuel = "valide"
-            supabase.table("historique_publications").update(
-                {"statut": "valide"}
-            ).eq("id", derniere_action["id"]).execute()
-        elif dernier_texte_recu == "non":
-            print("❌ 'non' détecté ! Passage à 'annule' et nouveau cycle...")
-            statut_actuel = "annule"
-            supabase.table("historique_publications").update(
-                {"statut": "annule"}
-            ).eq("id", derniere_action["id"]).execute()
-
-    if statut_actuel == "valide":
-        if not os.path.exists(FICHIER_RESULTAT):
-            img_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
-            r = requests.get(img_url)
-            with open(FICHIER_RESULTAT, "wb") as f:
-                f.write(r.content)
-
-        resultat = publier_sur_facebook(
-            derniere_action["texte_genere"], FICHIER_RESULTAT
-        )
-        if "error" not in resultat:
-            post_id = resultat.get("post_id") or resultat.get("id")
-            print(f"🎉 Publication réussie ! ID : {post_id}")
-            supabase.table("historique_publications").update(
-                {"statut": "termine"}
-            ).eq("id", derniere_action["id"]).execute()
-
-            try:
-                supabase.storage.from_(BUCKET_NAME).remove(
-                    [derniere_action["image_path"]]
-                )
-                print("🧹 Image temporaire supprimée du Storage Supabase.")
-            except Exception:
-                pass
-
-            bot = Bot(token=TELEGRAM_BOT_TOKEN)
-            asyncio.run(
-                bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=f"🎉 C'est en ligne sur Facebook avec succès ! (ID: {post_id})",
-                )
-            )
+        elif reponse == "non":
+            print("❌ Réponse 'non'. Passage à 'annule' et nouveau cycle...")
+            supabase.table("historique_publications").update({"statut": "annule"}).eq("id", derniere_action["id"]).execute()
+            texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
+            asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
         else:
-            print("❌ Échec Facebook :", resultat)
+            print("ℹ️ Aucune action Telegram détectée.")
 
-        texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-        asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+    # =========================================================================
+    # 2. SI STATUT EST "valide"
+    # =========================================================================
+    elif statut_actuel == "valide":
+        print("🔍 Post déjà validé. Vérification directe de la plage horaire...")
+        if verifier_plage_horaire():
+            print("🚀 Dans la plage horaire ! Publication et relance d'un nouveau cycle...")
+            if executer_publication_facebook(derniere_action):
+                texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
+                asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+        else:
+            print("⏸️ Hors de la plage horaire. Le script s'arrête en conservant le statut 'valide'.")
+            return
 
+    # =========================================================================
+    # 3. SI STATUT EST "en_attente"
+    # =========================================================================
     elif statut_actuel == "en_attente":
-        print("⏳ Le post est toujours en attente de votre réponse sur Telegram.")
-        return
+        reponse = verifier_reponse_telegram()
+        print(f"💬 Réponse Telegram détectée : '{reponse}'")
 
-    else:
-        if (
-            statut_actuel == "annule"
-            and derniere_action
-            and "image_path" in derniere_action
-        ):
-            try:
-                supabase.storage.from_(BUCKET_NAME).remove(
-                    [derniere_action["image_path"]]
-                )
-            except Exception:
-                pass
+        if reponse == "oui":
+            if verifier_plage_horaire():
+                print("🚀 'oui' reçu + dans la plage horaire ! Passage à 'valide', publication et relance...")
+                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
+                if executer_publication_facebook(derniere_action):
+                    texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
+                    asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+            else:
+                print("⏳ 'oui' reçu mais HORS plage horaire ! Passage à 'valide' en attente de l'heure.")
+                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
 
-        texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-        asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+        elif reponse == "non":
+            print("❌ 'non' reçu ! Passage à 'annule' et relance d'un nouveau cycle...")
+            supabase.table("historique_publications").update({"statut": "annule"}).eq("id", derniere_action["id"]).execute()
+            texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
+            asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+        else:
+            print("⏳ Toujours en attente de votre réponse sur Telegram.")
 
     print("\n✅ Script exécuté avec succès et terminé !")
 
