@@ -1,11 +1,11 @@
 name: Automatisation Saveurs Dammak
 
 on:
-  workflow_dispatch: # Permet de lancer le script manuellement depuis GitHub à tout moment
+  workflow_dispatch: # Permet de lancer le script manuellement à tout moment
   schedule:
-    # Exécution programmée tous les jours à 18h00 heure locale (Tunisie / UTC+1)
-    # Ce qui correspond à 17h00 UTC
-    - cron: '0 17 * * *'
+    # Exécution toutes les heures de 7h00 à 21h00 UTC
+    # Ce qui correspond exactement de 8h00 à 22h00 heure de Sfax (15 fois par jour)
+    - cron: '0 7-21 * * *'
 
 jobs:
   run-python-script:
