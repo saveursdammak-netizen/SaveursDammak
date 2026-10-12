@@ -1,0 +1,5 @@
+supabase
+requests
+Pillow
+python-telegram-bot
+httpx
