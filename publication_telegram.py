@@ -153,6 +153,16 @@ def extraire_image(message):
     return None
 
 
+def nettoyer_image_storage(image_path):
+    """Supprime proprement une image du Storage Supabase pour économiser l'espace."""
+    if image_path:
+        try:
+            supabase.storage.from_(BUCKET_NAME).remove([image_path])
+            print(f"🧹 Image '{image_path}' supprimée du Storage Supabase avec succès.")
+        except Exception as e:
+            print(f"⚠️ Erreur lors du nettoyage de l'image du Storage : {e}")
+
+
 def generer_nouveau_contenu():
     print("\n-----------------------------------------")
     print(f"🔄 Lancement du cycle créatif piloté par le Directeur Marketing ({MODELE_TEXTE})...")
@@ -404,7 +414,7 @@ def publier_sur_facebook(texte, image_path):
 
 
 def executer_publication_facebook(derniere_action):
-    """Effectue la publication effective sur Facebook et nettoie."""
+    """Effectue la publication effective sur Facebook et nettoie le Storage."""
     if not os.path.exists(FICHIER_RESULTAT):
         img_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
         r = requests.get(img_url)
@@ -417,11 +427,8 @@ def executer_publication_facebook(derniere_action):
         print(f"🎉 Publication réussie ! ID : {post_id}")
         supabase.table("historique_publications").update({"statut": "termine"}).eq("id", derniere_action["id"]).execute()
 
-        try:
-            supabase.storage.from_(BUCKET_NAME).remove([derniere_action["image_path"]])
-            print("🧹 Image temporaire supprimée du Storage Supabase.")
-        except Exception:
-            pass
+        # Nettoyage de l'image du Storage après publication réussie
+        nettoyer_image_storage(derniere_action.get("image_path"))
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         asyncio.run(
@@ -471,8 +478,12 @@ def main():
                 supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
 
         elif reponse == "non":
-            print("❌ Réponse 'non'. Passage à 'annule' et nouveau cycle...")
+            print("❌ Réponse 'non'. Passage à 'annule', nettoyage du Storage et nouveau cycle...")
             supabase.table("historique_publications").update({"statut": "annule"}).eq("id", derniere_action["id"]).execute()
+            
+            # Nettoyage immédiat de l'ancienne image refusée du Storage
+            nettoyer_image_storage(derniere_action.get("image_path"))
+
             texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
             asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
         else:
@@ -511,8 +522,12 @@ def main():
                 supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
 
         elif reponse == "non":
-            print("❌ 'non' reçu ! Passage à 'annule' et relance d'un nouveau cycle...")
+            print("❌ 'non' reçu ! Passage à 'annule', nettoyage du Storage et relance d'un nouveau cycle...")
             supabase.table("historique_publications").update({"statut": "annule"}).eq("id", derniere_action["id"]).execute()
+            
+            # Nettoyage immédiat de l'ancienne image refusée du Storage
+            nettoyer_image_storage(derniere_action.get("image_path"))
+
             texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
             asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
         else:
