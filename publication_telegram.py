@@ -47,15 +47,19 @@ PAGE_ACCESS_TOKEN = lire_table_supabase("table_token_facebook", "valeur")
 TELEGRAM_BOT_TOKEN = lire_table_supabase("table_telegram_token", "valeur")
 TELEGRAM_CHAT_ID = lire_table_supabase("table_telegram_chat_id", "valeur")
 
-# Récupération dynamique de l'ID de la page Facebook depuis Supabase (table_page_id)
+# Récupération dynamique de l'ID de la page Facebook et de l'ID Instagram Business
 PAGE_ID = lire_table_supabase("table_page_id", "valeur") or lire_table_supabase("table_page_id", "page_id") or "111157353629841"
+INSTAGRAM_BUSINESS_ID = lire_table_supabase("instagram_config", "valeur") or lire_table_supabase("instagram_config", "instagram_business_id") or "17841451463230647"
 
 PROMPTIX_URL = "https://promptix.tn/api/v1/chat/completions"
 
 MODELE_TEXTE = "google/gemini-3.8-flash"
 MODELE_IMAGE = "google/gemini-3.1-flash-image-preview"
 
-GRAPH_URL = f"https://graph.facebook.com/v26.0/{PAGE_ID}/photos"
+GRAPH_API_VERSION = "v26.0"
+BASE_GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+GRAPH_URL_FB = f"{BASE_GRAPH_URL}/{PAGE_ID}/photos"
+
 BUCKET_NAME = "patisseries"
 FICHIER_RESULTAT = "resultat.png"
 
@@ -235,7 +239,7 @@ def generer_nouveau_contenu():
     (Décris ici la mise en scène visuelle ultra-détaillée pour la photo : décors, fonds nobles, éclairage studio, ambiance, textures, sans fond blanc artificiel)
 
     [TEXTE_FACEBOOK]
-    (Rédige uniquement ici la publication Facebook finale en respectant scrupuleusement toutes les consignes ci-dessus)
+    (Rédige uniquement ici la publication Facebook/Instagram finale en respectant scrupuleusement toutes les consignes ci-dessus)
     """
 
     rep_directeur = appeler_promptix(
@@ -271,7 +275,7 @@ def generer_nouveau_contenu():
 
         texte_telegram = (
             f"<b>🎨 Direction Artistique :</b>\n<i>{da_partie}</i>\n\n"
-            f"<b>📝 Texte Facebook :</b>\n{texte_facebook}"
+            f"<b>📝 Texte Publication :</b>\n{texte_facebook}"
         )
         texte_final_facebook = texte_facebook
     else:
@@ -403,7 +407,7 @@ def publier_sur_facebook(texte, image_path):
     print("\n🚀 Publication sur Facebook en cours...")
     with open(image_path, "rb") as fichier:
         rep_fb = requests.post(
-            GRAPH_URL,
+            GRAPH_URL_FB,
             data={
                 "access_token": PAGE_ACCESS_TOKEN,
                 "message": texte,
@@ -415,33 +419,88 @@ def publier_sur_facebook(texte, image_path):
     return rep_fb.json()
 
 
-def executer_publication_facebook(derniere_action):
-    """Effectue la publication effective sur Facebook et nettoie le Storage."""
+def publier_sur_instagram(texte, image_url):
+    print("\n📸 Publication sur Instagram en cours...")
+    
+    # Étape 1 : Créer le conteneur média Instagram
+    container_endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media"
+    container_payload = {
+        "image_url": image_url,
+        "caption": texte,
+        "access_token": PAGE_ACCESS_TOKEN
+    }
+    
+    res_container = requests.post(container_endpoint, data=container_payload)
+    res_container_json = res_container.json()
+
+    if "id" not in res_container_json:
+        print(f"❌ Erreur création conteneur Instagram: {res_container_json}")
+        return {"error": res_container_json}
+
+    creation_id = res_container_json["id"]
+    print(f"🔹 Conteneur Instagram créé (ID: {creation_id})")
+
+    # Étape 2 : Publier le conteneur média
+    publish_endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media_publish"
+    publish_payload = {
+        "creation_id": creation_id,
+        "access_token": PAGE_ACCESS_TOKEN
+    }
+
+    res_publish = requests.post(publish_endpoint, data=publish_payload)
+    return res_publish.json()
+
+
+def executer_publication_facebook_et_instagram(derniere_action):
+    """Effectue la publication simultanée sur Facebook et Instagram, puis nettoie le Storage."""
     if not os.path.exists(FICHIER_RESULTAT):
         img_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
         r = requests.get(img_url)
         with open(FICHIER_RESULTAT, "wb") as f:
             f.write(r.content)
 
-    resultat = publier_sur_facebook(derniere_action["texte_genere"], FICHIER_RESULTAT)
-    if "error" not in resultat:
-        post_id = resultat.get("post_id") or resultat.get("id")
-        print(f"🎉 Publication réussie ! ID : {post_id}")
+    # URL publique de l'image stockée sur Supabase (nécessaire pour l'API Instagram)
+    image_publique_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
+    texte_post = derniere_action["texte_genere"]
+
+    # 1. Publication Facebook
+    resultat_fb = publier_sur_facebook(texte_post, FICHIER_RESULTAT)
+    succes_fb = "error" not in resultat_fb
+    fb_post_id = resultat_fb.get("post_id") or resultat_fb.get("id") if succes_fb else None
+
+    if succes_fb:
+        print(f"🎉 Publication Facebook réussie ! ID : {fb_post_id}")
+    else:
+        print("❌ Échec Facebook :", resultat_fb)
+
+    # 2. Publication Instagram
+    resultat_ig = publier_sur_instagram(texte_post, image_publique_url)
+    succes_ig = "error" not in resultat_ig
+    ig_post_id = resultat_ig.get("id") if succes_ig else None
+
+    if succes_ig:
+        print(f"🎉 Publication Instagram réussie ! ID : {ig_post_id}")
+    else:
+        print("❌ Échec Instagram :", resultat_ig)
+
+    # Si au moins l'une des deux publications a réussi (ou si on considère le tout validé)
+    if succes_fb or succes_ig:
         supabase.table("historique_publications").update({"statut": "termine"}).eq("id", derniere_action["id"]).execute()
 
-        # Nettoyage de l'image du Storage après publication réussie
+        # Nettoyage de l'image du Storage après publication
         nettoyer_image_storage(derniere_action.get("image_path"))
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        msg_recap = f"🎉 Publication réussie !\n📘 Facebook: {'✅' if succes_fb else '❌'}\n📸 Instagram: {'✅' if succes_ig else '❌'}"
         asyncio.run(
             bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=f"🎉 C'est en ligne sur Facebook avec succès ! (ID: {post_id})",
+                text=msg_recap,
             )
         )
         return True
     else:
-        print("❌ Échec Facebook :", resultat)
+        print("❌ Échec global des publications Facebook et Instagram.")
         return False
 
 
@@ -472,7 +531,7 @@ def main():
         if reponse == "oui":
             if verifier_plage_horaire():
                 print("🚀 Dans la plage horaire ! Publication immédiate...")
-                if executer_publication_facebook(derniere_action):
+                if executer_publication_facebook_et_instagram(derniere_action):
                     texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
                     asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
             else:
@@ -498,7 +557,7 @@ def main():
         print("🔍 Post déjà validé. Vérification directe de la plage horaire...")
         if verifier_plage_horaire():
             print("🚀 Dans la plage horaire ! Publication et relance d'un nouveau cycle...")
-            if executer_publication_facebook(derniere_action):
+            if executer_publication_facebook_et_instagram(derniere_action):
                 texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
                 asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
         else:
@@ -516,7 +575,7 @@ def main():
             if verifier_plage_horaire():
                 print("🚀 'oui' reçu + dans la plage horaire ! Passage à 'valide', publication et relance...")
                 supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
-                if executer_publication_facebook(derniere_action):
+                if executer_publication_facebook_et_instagram(derniere_action):
                     texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
                     asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
             else:
