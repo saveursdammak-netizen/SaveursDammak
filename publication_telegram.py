@@ -5,519 +5,594 @@ import json
 import os
 import random
 import time
+import uuid
+from datetime import datetime
+from urllib.parse import quote
+
 import requests
-from datetime import datetime, timezone
-from PIL import Image
+from PIL import Image, ImageOps
 from supabase import Client, create_client
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
-# ==========================================
-# 0. CHARGEMENT INITIAL DES CONFIGS DEPUIS SUPABASE
-# ==========================================
-print("Connexion à Supabase pour récupérer la configuration depuis les tables dédiées...")
-
+# ============================================================
+# CONFIGURATION
+# ============================================================
 SUPABASE_URL_DEFAUT = "https://acdqyhafpzrlrsheuxgq.supabase.co"
 SUPABASE_KEY_DEFAUT = "sb_publishable_ZbIRDJWZ1uGxV4ZsvsFxKg_0SoG4TOU"
 
-supabase_init: Client = create_client(SUPABASE_URL_DEFAUT, SUPABASE_KEY_DEFAUT)
-
-def lire_table_supabase(nom_table, colonne):
-    """Fonction utilitaire pour lire une valeur unique dans une table dédiée."""
-    try:
-        res = supabase_init.table(nom_table).select(colonne).limit(1).execute()
-        if res.data and res.data[0].get(colonne):
-            val = str(res.data[0][colonne]).strip()
-            val = val.strip('"').strip("'").strip()
-            return val
-    except Exception as e:
-        print(f"⚠️ Erreur lors de la lecture de {nom_table} : {e}")
-    return None
-
-url_lue = lire_table_supabase("table_url", "valeur")
-SUPABASE_URL = url_lue if (url_lue and url_lue.startswith("http")) else SUPABASE_URL_DEFAUT
-
-key_lue = lire_table_supabase("table_key", "valeur")
-SUPABASE_KEY = key_lue if key_lue else SUPABASE_KEY_DEFAUT
-
-if SUPABASE_URL != SUPABASE_URL_DEFAUT or SUPABASE_KEY != SUPABASE_KEY_DEFAUT:
-    supabase_init = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-PROMPTIX_KEY = lire_table_supabase("table_cle", "valeur")
-PAGE_ACCESS_TOKEN = lire_table_supabase("table_token_facebook", "valeur")
-TELEGRAM_BOT_TOKEN = lire_table_supabase("table_telegram_token", "valeur")
-TELEGRAM_CHAT_ID = lire_table_supabase("table_telegram_chat_id", "valeur")
-
-# Récupération dynamique de l'ID de la page Facebook et de l'ID Instagram Business (Corrigé)
-PAGE_ID = lire_table_supabase("table_page_id", "valeur") or lire_table_supabase("table_page_id", "page_id") or "111157353629841"
-INSTAGRAM_BUSINESS_ID = lire_table_supabase("instagram_config", "instagram_business_id") or lire_table_supabase("instagram_config", "valeur") or "17841451463230647"
-
 PROMPTIX_URL = "https://promptix.tn/api/v1/chat/completions"
-
 MODELE_TEXTE = "google/gemini-3.8-flash"
 MODELE_IMAGE = "google/gemini-3.1-flash-image-preview"
-
 GRAPH_API_VERSION = "v26.0"
-BASE_GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
-GRAPH_URL_FB = f"{BASE_GRAPH_URL}/{PAGE_ID}/photos"
-
 BUCKET_NAME = "patisseries"
 FICHIER_RESULTAT = "resultat.png"
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# IMPORTANT : mettez ici le nom EXACT du logo PNG transparent dans le bucket.
+# Exemple : "logo_transparent.png" ou "logo.png".
+LOGO_STORAGE_PATH = "saveurs_dammak_logo_transparent.png"
+GLOVO_STORAGE_PATH = "glovo.jpg"
+ZIGZAG_STORAGE_PATH = "zigzag.jpg"
+
+TIMEOUT_STANDARD = 60
+MAX_TENTATIVES_GENERATION = 3
+
+session = requests.Session()
+
+
+def lire_table_supabase(client: Client, nom_table: str, colonne: str):
+    try:
+        res = client.table(nom_table).select(colonne).limit(1).execute()
+        if res.data and res.data[0].get(colonne) is not None:
+            valeur = str(res.data[0][colonne]).strip().strip('"').strip("'")
+            return valeur or None
+    except Exception as exc:
+        print(f"⚠️ Lecture {nom_table}.{colonne} impossible : {exc}")
+    return None
+
+
+def initialiser_supabase():
+    client_initial = create_client(SUPABASE_URL_DEFAUT, SUPABASE_KEY_DEFAUT)
+    url = lire_table_supabase(client_initial, "table_url", "valeur") or SUPABASE_URL_DEFAUT
+    cle = lire_table_supabase(client_initial, "table_key", "valeur") or SUPABASE_KEY_DEFAUT
+    client = create_client(url, cle)
+    return client, url, cle
+
+
+supabase, SUPABASE_URL, SUPABASE_KEY = initialiser_supabase()
+PROMPTIX_KEY = lire_table_supabase(supabase, "table_cle", "valeur")
+PAGE_ACCESS_TOKEN = lire_table_supabase(supabase, "table_token_facebook", "valeur")
+TELEGRAM_BOT_TOKEN = lire_table_supabase(supabase, "table_telegram_token", "valeur")
+TELEGRAM_CHAT_ID = lire_table_supabase(supabase, "table_telegram_chat_id", "valeur")
+PAGE_ID = (
+    lire_table_supabase(supabase, "table_page_id", "valeur")
+    or lire_table_supabase(supabase, "table_page_id", "page_id")
+    or "111157353629841"
+)
+INSTAGRAM_BUSINESS_ID = (
+    lire_table_supabase(supabase, "instagram_config", "instagram_business_id")
+    or lire_table_supabase(supabase, "instagram_config", "valeur")
+    or "17841451463230647"
+)
+
+BASE_GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+GRAPH_URL_FB = f"{BASE_GRAPH_URL}/{PAGE_ID}/photos"
+
+
+def verifier_configuration():
+    manquants = []
+    for nom, valeur in [
+        ("PROMPTIX_KEY/table_cle", PROMPTIX_KEY),
+        ("PAGE_ACCESS_TOKEN/table_token_facebook", PAGE_ACCESS_TOKEN),
+        ("TELEGRAM_BOT_TOKEN/table_telegram_token", TELEGRAM_BOT_TOKEN),
+        ("TELEGRAM_CHAT_ID/table_telegram_chat_id", TELEGRAM_CHAT_ID),
+    ]:
+        if not valeur:
+            manquants.append(nom)
+    if manquants:
+        raise RuntimeError("Configuration manquante dans Supabase : " + ", ".join(manquants))
+
 
 def recuperer_restriction_supabase(nom_table):
-    """Récupère le contenu textuel d'une consigne depuis sa table dédiée."""
     try:
         res = supabase.table(nom_table).select("contenu").limit(1).execute()
         if res.data:
-            return res.data[0]["contenu"]
-    except Exception as e:
-        print(f"⚠️ Erreur récupération restriction de {nom_table} : {e}")
+            return str(res.data[0].get("contenu") or "").strip()
+    except Exception as exc:
+        print(f"⚠️ Restriction {nom_table} indisponible : {exc}")
     return ""
 
 
 def verifier_plage_horaire():
-    """Vérifie si l'heure actuelle du serveur est dans la plage horaire définie dans Supabase."""
     try:
         res = supabase.table("table_horaires_publication").select("*").limit(1).execute()
-        if res.data:
-            h_debut_str = res.data[0]["heure_debut"]
-            h_fin_str = res.data[0]["heure_fin"]
-
-            h_debut = datetime.strptime(h_debut_str, "%H:%M:%S").time()
-            h_fin = datetime.strptime(h_fin_str, "%H:%M:%S").time()
-
-            maintenant = datetime.now().time()
-
-            est_dans_plage = h_debut <= maintenant <= h_fin
-            print(f"⏰ Plage horaire autorisée : {h_debut} à {h_fin} | Heure actuelle : {maintenant.strftime('%H:%M:%S')}")
-            print(f"📌 Dans l'intervalle ? {'OUI' if est_dans_plage else 'NON'}")
-            return est_dans_plage
-    except Exception as e:
-        print(f"⚠️ Erreur vérification plage horaire : {e}")
-    return True
+        if not res.data:
+            return True
+        ligne = res.data[0]
+        debut_txt = str(ligne.get("heure_debut", "00:00:00"))
+        fin_txt = str(ligne.get("heure_fin", "23:59:59"))
+        debut = datetime.strptime(debut_txt, "%H:%M:%S").time()
+        fin = datetime.strptime(fin_txt, "%H:%M:%S").time()
+        maintenant = datetime.now().time()
+        # Gère aussi une plage qui traverse minuit.
+        dans_plage = debut <= maintenant <= fin if debut <= fin else (maintenant >= debut or maintenant <= fin)
+        print(f"⏰ Plage : {debut}–{fin} | Maintenant : {maintenant.strftime('%H:%M:%S')} | Autorisée : {dans_plage}")
+        return dans_plage
+    except Exception as exc:
+        print(f"⚠️ Vérification horaire impossible : {exc}")
+        return True
 
 
 def verifier_reponse_telegram_securisee(date_creation_post_utc):
-    """
-    Interroge Telegram et vérifie qu'une réponse 'oui' ou 'non' a été envoyée
-    STRICTEMENT APRÈS la date de création de la proposition dans Supabase.
-    """
-    url_updates = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return ""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
-        rep_tg = requests.get(url_updates, timeout=30).json()
-        if rep_tg.get("ok"):
-            resultats = rep_tg.get("result", [])
-            for res in reversed(resultats):
-                message = res.get("message", {})
-                if str(message.get("chat", {}).get("id")) == str(TELEGRAM_CHAT_ID):
-                    msg_timestamp = message.get("date")  # Timestamp UNIX en UTC
-                    texte_msg = message.get("text", "").strip().lower()
-
-                    if msg_timestamp and date_creation_post_utc:
-                        if msg_timestamp > date_creation_post_utc:
-                            if texte_msg in ["oui", "valider"]:
-                                print(f"🟢 'oui' VALIDE reçu sur Telegram (Envoyé à {msg_timestamp} > Créé à {date_creation_post_utc})")
-                                return "oui"
-                            elif texte_msg in ["non", "refuser"]:
-                                print(f"🔴 'non' VALIDE reçu sur Telegram (Envoyé à {msg_timestamp} > Créé à {date_creation_post_utc})")
-                                return "non"
-                        else:
-                            print(f"⚠️ Ancien message Telegram ignoré (Envoyé à {msg_timestamp} <= Créé à {date_creation_post_utc})")
-                            break
-    except Exception as e:
-        print(f"⚠️ Erreur lors de la lecture sécurisée de Telegram : {e}")
-    return ""
-
-
-def photo_en_base64(img, taille_max):
-    copie = img.copy()
-    copie.thumbnail((taille_max, taille_max))
-    tampon = io.BytesIO()
-    copie.save(tampon, format="JPEG", quality=90)
-    octets = tampon.getvalue()
-    return base64.b64encode(octets).decode("ascii")
+        reponse = session.get(url, timeout=30)
+        reponse.raise_for_status()
+        contenu = reponse.json()
+        if not contenu.get("ok"):
+            return ""
+        for item in reversed(contenu.get("result", [])):
+            message = item.get("message") or item.get("edited_message") or {}
+            chat_id = str((message.get("chat") or {}).get("id", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+            timestamp = message.get("date")
+            texte = str(message.get("text") or "").strip().lower()
+            if not timestamp or not date_creation_post_utc:
+                continue
+            if timestamp <= date_creation_post_utc:
+                # Les mises à jour Telegram sont chronologiques ; on ignore les anciens messages.
+                continue
+            if texte in ("oui", "valider"):
+                return "oui"
+            if texte in ("non", "refuser"):
+                return "non"
+        return ""
+    except Exception as exc:
+        print(f"⚠️ Lecture Telegram impossible : {exc}")
+        return ""
 
 
-def telecharger_image_supabase(supabase_client, bucket, nom_fichier):
+def telecharger_fichier_storage(nom_fichier):
+    chemin = str(nom_fichier or "").lstrip("/")
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{quote(chemin, safe='/')}"
     try:
-        url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{nom_fichier}"
-        rep = requests.get(url, timeout=60)
-        if rep.status_code == 200:
-            return Image.open(io.BytesIO(rep.content)).convert("RGB")
-    except Exception as e:
-        print(f"⚠️ Impossible de charger {nom_fichier} : {e}")
+        reponse = session.get(url, timeout=TIMEOUT_STANDARD)
+        if reponse.status_code == 200:
+            return reponse.content
+        print(f"⚠️ Storage {chemin}: HTTP {reponse.status_code}")
+    except Exception as exc:
+        print(f"⚠️ Téléchargement {chemin} impossible : {exc}")
     return None
 
 
+def telecharger_image_supabase(nom_fichier, conserver_alpha=False):
+    contenu = telecharger_fichier_storage(nom_fichier)
+    if not contenu:
+        return None
+    try:
+        image = Image.open(io.BytesIO(contenu))
+        image.load()
+        return image.convert("RGBA" if conserver_alpha else "RGB")
+    except Exception as exc:
+        print(f"⚠️ Image {nom_fichier} illisible : {exc}")
+        return None
+
+
+def photo_en_base64(img, taille_max=1024, format_image="JPEG"):
+    copie = img.copy()
+    copie.thumbnail((taille_max, taille_max), Image.Resampling.LANCZOS)
+    tampon = io.BytesIO()
+    if format_image.upper() == "PNG":
+        copie.save(tampon, format="PNG", optimize=True)
+    else:
+        if copie.mode not in ("RGB", "L"):
+            fond = Image.new("RGB", copie.size, "white")
+            if copie.mode == "RGBA":
+                fond.paste(copie, mask=copie.getchannel("A"))
+            else:
+                fond.paste(copie.convert("RGB"))
+            copie = fond
+        copie.save(tampon, format="JPEG", quality=92, optimize=True)
+    return base64.b64encode(tampon.getvalue()).decode("ascii")
+
+
 def appeler_promptix(payload):
-    return requests.post(
+    if not PROMPTIX_KEY:
+        raise RuntimeError("Clé Promptix absente (table_cle).")
+    return session.post(
         PROMPTIX_URL,
-        headers={"Authorization": "Bearer " + PROMPTIX_KEY},
+        headers={"Authorization": f"Bearer {PROMPTIX_KEY}"},
         json=payload,
         timeout=300,
     )
 
 
 def extraire_image(message):
-    for image in message.get("images") or []:
-        url = image.get("image_url", {}).get("url", "")
-        if url.startswith("data:image/"):
-            return base64.b64decode(url.split(",", 1)[1])
-        if url.startswith("http"):
-            rep = requests.get(url, timeout=120)
-            rep.raise_for_status()
-            return rep.content
+    for element in message.get("images") or []:
+        url = (element.get("image_url") or {}).get("url", "")
+        try:
+            if url.startswith("data:image/"):
+                return base64.b64decode(url.split(",", 1)[1])
+            if url.startswith("http://") or url.startswith("https://"):
+                rep = session.get(url, timeout=120)
+                rep.raise_for_status()
+                return rep.content
+        except Exception as exc:
+            print(f"⚠️ Récupération de l'image générée impossible : {exc}")
+    # Certains fournisseurs renvoient l'image dans le contenu texte.
+    contenu = message.get("content")
+    if isinstance(contenu, list):
+        for bloc in contenu:
+            if isinstance(bloc, dict):
+                url = (bloc.get("image_url") or {}).get("url", "")
+                if url.startswith("data:image/"):
+                    return base64.b64decode(url.split(",", 1)[1])
     return None
 
 
 def nettoyer_image_storage(image_path):
-    """Supprime proprement une image du Storage Supabase pour économiser l'espace."""
-    if image_path:
-        try:
-            supabase.storage.from_(BUCKET_NAME).remove([image_path])
-            print(f"🧹 Image '{image_path}' supprimée du Storage Supabase avec succès.")
-        except Exception as e:
-            print(f"⚠️ Erreur lors du nettoyage de l'image du Storage : {e}")
+    if not image_path:
+        return
+    try:
+        supabase.storage.from_(BUCKET_NAME).remove([image_path])
+        print(f"🧹 Image temporaire supprimée : {image_path}")
+    except Exception as exc:
+        print(f"⚠️ Nettoyage Storage impossible : {exc}")
+
+
+def incruster_logo(image_base, logo, position="haut_droite", largeur_relative=0.20, marge_relative=0.035):
+    """Incruste un logo PNG déjà transparent, après la génération IA."""
+    base = image_base.convert("RGBA")
+    if logo is None:
+        print("⚠️ Aucun logo chargé : image publiée sans incrustation du logo.")
+        return base
+
+    logo = logo.convert("RGBA")
+    if logo.getchannel("A").getextrema() == (255, 255):
+        print(
+            "⚠️ Le logo n'a pas de transparence (alpha entièrement opaque). "
+            "Ne pas l'incruster automatiquement pour éviter un carré visible. "
+            "Utilise un vrai PNG transparent."
+        )
+        return base
+
+    largeur = max(1, int(base.width * largeur_relative))
+    hauteur = max(1, round(logo.height * largeur / logo.width))
+    logo.thumbnail((largeur, hauteur), Image.Resampling.LANCZOS)
+    marge = int(min(base.size) * marge_relative)
+
+    if position == "haut_centre":
+        x = (base.width - logo.width) // 2
+        y = marge
+    elif position == "haut_droite":
+        x = base.width - logo.width - marge
+        y = marge
+    else:
+        x = base.width - logo.width - marge
+        y = base.height - logo.height - marge
+
+    base.alpha_composite(logo, (max(0, x), max(0, y)))
+    return base
+
+
+def televerser_image_temporaire(image, nom_fichier):
+    tampon = io.BytesIO()
+    image.save(tampon, format="PNG", optimize=True)
+    tampon.seek(0)
+    supabase.storage.from_(BUCKET_NAME).upload(
+        nom_fichier,
+        tampon.getvalue(),
+        file_options={"content-type": "image/png", "upsert": "true"},
+    )
 
 
 def generer_nouveau_contenu():
     print("\n-----------------------------------------")
-    print(f"🔄 Lancement du cycle créatif piloté par le Directeur Marketing ({MODELE_TEXTE})...")
+    print(f"🔄 Nouveau cycle créatif ({MODELE_TEXTE})")
 
-    articles = supabase.table("articles").select("*").execute().data
+    articles = supabase.table("articles").select("*").execute().data or []
     if not articles:
-        raise SystemExit("Aucune donnée dans la table 'articles'.")
+        raise RuntimeError("Aucune donnée dans la table 'articles'.")
 
-    sac_de_tirage = []
-    for art in articles:
-        importance = int(art.get("importance") or 3)
-        sac_de_tirage.extend([art] * importance)
+    sac = []
+    for article in articles:
+        try:
+            poids = max(1, min(int(article.get("importance") or 3), 20))
+        except (TypeError, ValueError):
+            poids = 3
+        sac.extend([article] * poids)
+    article = random.choice(sac)
+    nom_article = str(article.get("article") or "notre création")
+    categorie = str(article.get("categorie") or "Pâtisserie")
+    print(f"📌 Produit choisi : {nom_article} ({categorie})")
 
-    article = random.choice(sac_de_tirage)
-    print(f"📌 Article tiré : {article['article']} ({article['categorie']})")
+    ref_photo = str(article.get("ref_photo") or "").strip()
+    if not ref_photo:
+        raise RuntimeError(f"Aucune ref_photo pour l'article {nom_article}.")
 
-    ref_photo_brut = str(article["ref_photo"]).strip()
-    
-    extensions_a_tester = []
-    if ref_photo_brut.lower().endswith((".jpg", ".jpeg", ".png")):
-        extensions_a_tester = [ref_photo_brut]
-    else:
-        extensions_a_tester = [
-            f"{ref_photo_brut}.jpeg",
-            f"{ref_photo_brut}.jpg",
-            f"{ref_photo_brut}.png"
-        ]
-
+    candidats = [ref_photo] if ref_photo.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) else [
+        f"{ref_photo}.jpeg", f"{ref_photo}.jpg", f"{ref_photo}.png", f"{ref_photo}.webp"
+    ]
     photo = None
-    for ref_photo_path in extensions_a_tester:
-        photo_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{ref_photo_path}"
-        print(f"📥 Tentative de téléchargement : {ref_photo_path}...")
-        rep = requests.get(photo_url, timeout=60)
-        if rep.status_code == 200:
-            try:
-                photo = Image.open(io.BytesIO(rep.content)).convert("RGB")
-                print(f"✅ Photo chargée avec succès depuis {ref_photo_path}")
-                break
-            except Exception:
-                pass
-
+    for chemin in candidats:
+        photo = telecharger_image_supabase(chemin)
+        if photo is not None:
+            print(f"✅ Photo source chargée : {chemin}")
+            break
     if photo is None:
-        print(f"⚠️ Impossible de télécharger l'image pour l'article {article['article']}. On retente...")
-        return generer_nouveau_contenu()
+        raise RuntimeError(f"Impossible de télécharger la photo de {nom_article}. Vérifie ref_photo et le bucket.")
 
-    print("📥 Téléchargement des logos et récupération des restrictions depuis les tables Supabase...")
-    img_logo = telecharger_image_supabase(supabase, BUCKET_NAME, "logo.jpg")
-    img_glovo = telecharger_image_supabase(supabase, BUCKET_NAME, "glovo.jpg")
-    img_zigzag = telecharger_image_supabase(supabase, BUCKET_NAME, "zigzag.jpg")
+    print("📥 Chargement du logo et des logos partenaires…")
+    logo = telecharger_image_supabase(LOGO_STORAGE_PATH, conserver_alpha=True)
+    glovo = telecharger_image_supabase(GLOVO_STORAGE_PATH, conserver_alpha=True)
+    zigzag = telecharger_image_supabase(ZIGZAG_STORAGE_PATH, conserver_alpha=True)
+    if logo is None:
+        print(f"⚠️ Logo introuvable ({LOGO_STORAGE_PATH}). Vérifie le nom exact dans Storage.")
 
-    restrictions_image_texte = recuperer_restriction_supabase("table_restriction_image")
-    restrictions_texte_publication = recuperer_restriction_supabase("table_restriction_texte")
+    restriction_image = recuperer_restriction_supabase("table_restriction_image")
+    restriction_texte = recuperer_restriction_supabase("table_restriction_texte")
 
-    print("🧠 Le Directeur Marketing IA analyse le produit et conçoit la stratégie globale...")
     prompt_directeur = f"""
-    Agis en tant que Directeur Marketing et Directeur Artistique senior (20 ans d'expérience dans la haute pâtisserie internationale et tunisienne).
-    
-    Produit :
-    - Nom : {article['article']}
-    - Catégorie : {article['categorie']}
+Tu es directeur marketing d'une maison de pâtisserie fine à Sfax.
+Produit : {nom_article}
+Catégorie : {categorie}
 
-    {restrictions_texte_publication}
+Consignes de texte à respecter :
+{restriction_texte}
 
-    Mission :
-    Crée un plan créatif complet structuré STRICTEMENT avec ces deux balises :
-
-    [DIRECTION_ARTISTIQUE_IMAGE]
-    (Décris ici la mise en scène visuelle ultra-détaillée pour la photo : décors, fonds nobles, éclairage studio, ambiance, textures, sans fond blanc artificiel)
-
-    [TEXTE_FACEBOOK]
-    (Rédige uniquement ici la publication Facebook/Instagram finale en respectant scrupuleusement toutes les consignes ci-dessus)
-    """
-
-    rep_directeur = appeler_promptix(
-        {
-            "model": MODELE_TEXTE,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_directeur},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": "data:image/jpeg;base64," + photo_en_base64(photo, 1024)
-                            },
-                        },
-                    ],
-                }
+Réponds avec EXACTEMENT ces deux sections :
+[DIRECTION_ARTISTIQUE_IMAGE]
+Une description visuelle concise, réaliste et réalisable, qui met en valeur le produit réellement présent dans la photo.
+[TEXTE_FACEBOOK]
+Le texte final prêt à publier. N'invente aucun ingrédient, label, certification, prix, disponibilité ou caractéristique non fourni.
+Ne répète pas le même texte générique. Écris en français naturel, élégant et spécifique au produit.
+"""
+    rep = appeler_promptix({
+        "model": MODELE_TEXTE,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_directeur},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(photo)}},
             ],
-        }
-    )
+        }],
+    })
+    rep.raise_for_status()
+    donnees = rep.json()
+    contenu = donnees.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not contenu:
+        raise RuntimeError(f"Promptix n'a pas renvoyé de texte exploitable : {json.dumps(donnees, ensure_ascii=False)[:1000]}")
 
-    if rep_directeur.ok:
-        contenu_ia = rep_directeur.json()["choices"][0]["message"]["content"].strip()
+    if "[TEXTE_FACEBOOK]" not in contenu:
+        raise RuntimeError("Réponse du directeur IA incomplète : balise [TEXTE_FACEBOOK] absente.")
+    parties = contenu.split("[TEXTE_FACEBOOK]", 1)
+    direction = parties[0].replace("[DIRECTION_ARTISTIQUE_IMAGE]", "").strip()
+    texte_facebook = parties[1].strip()
 
-        if "[TEXTE_FACEBOOK]" in contenu_ia:
-            parties = contenu_ia.split("[TEXTE_FACEBOOK]")
-            da_partie = parties[0].replace("[DIRECTION_ARTISTIQUE_IMAGE]", "").strip()
-            texte_facebook = parties[1].strip()
-        else:
-            da_partie = contenu_ia
-            texte_facebook = contenu_ia
+    # Règles minimales côté code pour éviter qu'un modèle oublie les points de vente.
+    # Le texte exact reste défini dans la table de restrictions.
+    if "RETROUVEZ-NOUS" not in texte_facebook:
+        print("⚠️ Le texte IA n'inclut pas RETROUVEZ-NOUS : vérifie la restriction en base.")
+    if "#SaveursDammak" not in texte_facebook:
+        texte_facebook = texte_facebook.rstrip() + "\n\n#SaveursDammak #PatisserieFine #Sfax #Tunisie"
 
-        texte_telegram = (
-            f"<b>🎨 Direction Artistique :</b>\n<i>{da_partie}</i>\n\n"
-            f"<b>📝 Texte Publication :</b>\n{texte_facebook}"
-        )
-        texte_final_facebook = texte_facebook
-    else:
-        print("⚠️ Erreur génération Directeur Marketing, secours...")
-        da_partie = "Mets en valeur les textures et l'éclat de cette création dans un décor de haute pâtisserie."
-        texte_final_facebook = (
-            f"Découvrez notre {article['article']} chez Saveurs Dammak.\n\n"
-            f"📍 Route de Saltnia – Km 3,5 · 📞 99 460 036\n#SaveursDammak #Sfax"
-        )
-        texte_telegram = texte_final_facebook
-
-    print("🎨 Exécution de la retouche visuelle et incrustation du branding...")
-    
-    contenu_message_image = [
-        {"type": "text", "text": f"{restrictions_image_texte}\n\nDirection Artistique globale : {da_partie}"},
-        {"type": "text", "text": "IMAGE PRINCIPALE : Creation de patisserie a sublimer."},
+    # Les logos partenaires sont fournis comme références visuelles seulement.
+    # On ne force pas leur affichage : cela évite les logos déformés ou omniprésents.
+    contenu_image = [
+        {
+            "type": "text",
+            "text": (
+                "Améliore la photo du produit en conservant fidèlement sa forme, sa décoration, "
+                "ses couleurs et son identité. Ne change pas le produit en un autre dessert. "
+                "Ne dessine aucun texte, aucune étiquette, aucun logo et aucun filigrane. "
+                "Le logo officiel sera ajouté ensuite par le programme. "
+                "Direction artistique : " + direction + "\nConsignes de composition : " + restriction_image
+            ),
+        },
         {
             "type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(photo, 1024)},
+            "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(photo)},
         },
     ]
+    if glovo:
+        contenu_image.extend([
+            {"type": "text", "text": "Référence de logo partenaire Glovo uniquement. Ne le redessine pas et ne l'ajoute pas à l'image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + photo_en_base64(glovo, 512, "PNG")}},
+        ])
+    if zigzag:
+        contenu_image.extend([
+            {"type": "text", "text": "Référence de logo partenaire Zigzag uniquement. Ne le redessine pas et ne l'ajoute pas à l'image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + photo_en_base64(zigzag, 512, "PNG")}},
+        ])
 
-    if img_logo:
-        contenu_message_image.append({"type": "text", "text": "IMAGE LOGO OFFICIEL : C'est le logo 'Saveurs Dammak'. ATTENTION : Supprime complètement son fond carré d'origine. Incruste UNIQUEMENT le texte et le monogramme SD de manière élégante, transparente et fluide en haut à droite (sans aucun cadre rectangulaire ou carré autour)."})
-        contenu_message_image.append({
-            "type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(img_logo, 512)},
-        })
-
-    if img_glovo:
-        contenu_message_image.append({"type": "text", "text": "IMAGE PARTENAIRE 1 : Logo Glovo à placer en bas à gauche, taille égale à Zigzag, sans fond carré disgracieux."})
-        contenu_message_image.append({
-            "type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(img_glovo, 512)},
-        })
-
-    if img_zigzag:
-        contenu_message_image.append({"type": "text", "text": "IMAGE PARTENAIRE 2 : Logo Zigzag à placer en bas à gauche juste à côté de Glovo, même taille et même hauteur."})
-        contenu_message_image.append({
-            "type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64," + photo_en_base64(img_zigzag, 512)},
-        })
-
-    reponse_img = appeler_promptix(
-        {
-            "model": MODELE_IMAGE,
-            "modalities": ["image", "text"],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": contenu_message_image,
-                }
-            ],
-        }
-    )
-
-    if not reponse_img or not reponse_img.ok:
-        print(f"⚠️ Erreur retouche d'image, on retente...")
-        return generer_nouveau_contenu()
-
-    message = reponse_img.json().get("choices", [{}])[0].get("message", {})
+    rep_image = appeler_promptix({
+        "model": MODELE_IMAGE,
+        "modalities": ["image", "text"],
+        "messages": [{"role": "user", "content": contenu_image}],
+    })
+    rep_image.raise_for_status()
+    donnees_image = rep_image.json()
+    message = donnees_image.get("choices", [{}])[0].get("message", {})
     image_bytes = extraire_image(message)
     if not image_bytes:
-        print("⚠️ Aucune image retournée, on retente...")
-        return generer_nouveau_contenu()
+        raise RuntimeError(f"Aucune image renvoyée par le modèle image : {json.dumps(donnees_image, ensure_ascii=False)[:1200]}")
 
-    with Image.open(io.BytesIO(image_bytes)) as im:
-        im.convert("RGB").save(FICHIER_RESULTAT, format="PNG")
+    with Image.open(io.BytesIO(image_bytes)) as image_generee:
+        image_finale = ImageOps.exif_transpose(image_generee).convert("RGBA")
 
-    nom_fichier_storage = f"temp_{random.randint(10000, 99999)}.png"
-    print("☁️ Upload temporaire sur Supabase Storage...")
-    with open(FICHIER_RESULTAT, "rb") as f:
-        supabase.storage.from_(BUCKET_NAME).upload(nom_fichier_storage, f)
+    # Incruster le logo APRÈS l'IA, afin que Gemini ne le redessine pas.
+    image_finale = incruster_logo(image_finale, logo, position="haut_droite")
+    image_finale.convert("RGB").save(FICHIER_RESULTAT, format="PNG", optimize=True)
 
-    print("💾 Enregistrement dans Supabase...")
-    data_insertion = {
-        "article_nom": article["article"],
-        "categorie": article["categorie"],
-        "scenario_titre": "Directeur Marketing & Branding (Tables Supabase Dédiées)",
-        "texte_genere": texte_final_facebook,
-        "image_path": nom_fichier_storage,
+    nom_temp = f"temp_{uuid.uuid4().hex[:12]}.png"
+    televerser_image_temporaire(image_finale.convert("RGB"), nom_temp)
+
+    insertion = {
+        "article_nom": nom_article,
+        "categorie": categorie,
+        "scenario_titre": "Direction marketing + incrustation logo post-traitement",
+        "texte_genere": texte_facebook,
+        "image_path": nom_temp,
         "statut": "en_attente",
     }
-    supabase.table("historique_publications").insert(data_insertion).execute()
+    resultat_insert = supabase.table("historique_publications").insert(insertion).execute()
+    if not resultat_insert.data:
+        nettoyer_image_storage(nom_temp)
+        raise RuntimeError("La proposition a été créée en image mais l'insertion historique n'a pas confirmé de ligne.")
 
-    print("✨ Cycle créatif terminé avec succès !")
-    return texte_telegram, FICHIER_RESULTAT, nom_fichier_storage
+    print(f"✨ Proposition enregistrée. Image temporaire : {nom_temp}")
+    texte_telegram = (
+        "<b>🎨 Direction artistique :</b>\n" + direction +
+        "\n\n<b>📝 Texte de publication :</b>\n" + texte_facebook
+    )
+    return texte_telegram, FICHIER_RESULTAT, nom_temp
 
 
 async def envoyer_vers_telegram(texte, image_path):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Configuration Telegram manquante.")
     request = HTTPXRequest(read_timeout=60, write_timeout=60, connect_timeout=60)
     bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
-    
-    header = (
-        "<b>🍰 Proposition Saveurs Dammak (Tables Dédiées Cloud) :</b>\n\n"
-        "<i>💬 Répondez simplement par <b>'oui'</b> pour valider et publier, "
-        "ou <b>'non'</b> pour refuser et générer un autre visuel.</i>\n\n"
+    entete = (
+        "<b>🍰 Proposition Saveurs Dammak</b>\n\n"
+        "<i>Réponds « oui » pour valider et publier, ou « non » pour refuser.</i>\n\n"
     )
-    message_complet = header + texte
+    message_complet = entete + texte
 
-    with Image.open(image_path) as img:
-        img.thumbnail((1200, 1200))
-        img.save(image_path, "JPEG", quality=85)
-
-    with open(image_path, "rb") as photo_file:
+    with open(image_path, "rb") as photo:
         if len(message_complet) <= 1024:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=photo_file,
-                caption=message_complet,
-                parse_mode="HTML",
-            )
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo, caption=message_complet, parse_mode="HTML")
         else:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=photo_file,
-                caption="<b>🍰 Visuel retouché (voir texte ci-dessous) :</b>",
-                parse_mode="HTML",
-            )
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message_complet,
-                parse_mode="HTML",
-            )
-    print("📱 Notification envoyée sur Telegram avec succès !")
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo, caption=entete, parse_mode="HTML")
+            # Telegram HTML : le texte IA peut contenir <, > ou &, on l'envoie en texte brut.
+            texte_brut = message_complet.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=texte_brut)
+    print("📱 Proposition envoyée sur Telegram.")
 
 
 def publier_sur_facebook(texte, image_path):
-    print("\n🚀 Publication sur Facebook en cours...")
+    if not PAGE_ACCESS_TOKEN:
+        return {"error": {"message": "PAGE_ACCESS_TOKEN absent"}}
     with open(image_path, "rb") as fichier:
-        rep_fb = requests.post(
+        rep = session.post(
             GRAPH_URL_FB,
-            data={
-                "access_token": PAGE_ACCESS_TOKEN,
-                "message": texte,
-                "published": "true",
-            },
+            data={"access_token": PAGE_ACCESS_TOKEN, "message": texte, "published": "true"},
             files={"source": ("resultat.png", fichier, "image/png")},
             timeout=180,
         )
-    return rep_fb.json()
+    try:
+        resultat = rep.json()
+    except ValueError:
+        resultat = {"error": {"message": f"Réponse non JSON, HTTP {rep.status_code}", "body": rep.text[:500]}}
+    if not rep.ok:
+        resultat.setdefault("error", {"message": f"Facebook HTTP {rep.status_code}"})
+    return resultat
 
 
 def publier_sur_instagram(texte, image_url):
-    print("\n📸 Publication sur Instagram en cours...")
-    
-    container_endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media"
-    container_payload = {
-        "image_url": image_url,
-        "caption": texte,
-        "access_token": PAGE_ACCESS_TOKEN
-    }
-    
-    res_container = requests.post(container_endpoint, data=container_payload)
-    res_container_json = res_container.json()
+    if not PAGE_ACCESS_TOKEN:
+        return {"error": {"message": "PAGE_ACCESS_TOKEN absent"}}
+    endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media"
+    try:
+        rep = session.post(
+            endpoint,
+            data={"image_url": image_url, "caption": texte, "access_token": PAGE_ACCESS_TOKEN},
+            timeout=120,
+        )
+        resultat = rep.json()
+        if not rep.ok or "id" not in resultat:
+            return {"error": resultat}
 
-    if "id" not in res_container_json:
-        print(f"❌ Erreur création conteneur Instagram: {res_container_json}")
-        return {"error": res_container_json}
+        creation_id = resultat["id"]
+        endpoint_publish = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media_publish"
+        # Vérifie l'état du conteneur au lieu d'attendre arbitrairement 10 secondes.
+        for tentative in range(6):
+            statut_rep = session.get(
+                f"{BASE_GRAPH_URL}/{creation_id}",
+                params={"fields": "status_code", "access_token": PAGE_ACCESS_TOKEN},
+                timeout=60,
+            )
+            statut_json = statut_rep.json()
+            statut = statut_json.get("status_code")
+            if statut == "FINISHED":
+                break
+            if statut in ("ERROR", "EXPIRED"):
+                return {"error": {"message": "Conteneur Instagram non prêt", "details": statut_json}}
+            time.sleep(5)
+        else:
+            return {"error": {"message": "Délai dépassé en attendant le conteneur Instagram"}}
 
-    creation_id = res_container_json["id"]
-    print(f"🔹 Conteneur Instagram créé (ID: {creation_id})")
-
-    # ⏱️ Pause de sécurité pour laisser le temps à Meta de télécharger l'image
-    print("⏳ Patientons 10 secondes pour que l'image soit prête chez Meta...")
-    time.sleep(10)
-
-    publish_endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media_publish"
-    publish_payload = {
-        "creation_id": creation_id,
-        "access_token": PAGE_ACCESS_TOKEN
-    }
-
-    res_publish = requests.post(publish_endpoint, data=publish_payload)
-    return res_publish.json()
+        publication = session.post(
+            endpoint_publish,
+            data={"creation_id": creation_id, "access_token": PAGE_ACCESS_TOKEN},
+            timeout=120,
+        )
+        resultat_publication = publication.json()
+        if not publication.ok or "id" not in resultat_publication:
+            return {"error": resultat_publication}
+        return resultat_publication
+    except Exception as exc:
+        return {"error": {"message": str(exc)}}
 
 
-def executer_publication_facebook_et_instagram(derniere_action):
-    """Effectue la publication simultanée sur Facebook et Instagram, puis nettoie le Storage."""
-    if not os.path.exists(FICHIER_RESULTAT):
-        img_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
-        r = requests.get(img_url)
-        with open(FICHIER_RESULTAT, "wb") as f:
-            f.write(r.content)
+def executer_publication_facebook_et_instagram(action):
+    chemin_image = action.get("image_path")
+    if not chemin_image:
+        print("❌ image_path absent dans la proposition.")
+        return False
 
-    image_publique_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{derniere_action['image_path']}"
-    texte_post = derniere_action["texte_genere"]
+    # Télécharger exactement l'image associée à cette ligne, pas une ancienne resultat.png.
+    octets = telecharger_fichier_storage(chemin_image)
+    if not octets:
+        print(f"❌ Image temporaire introuvable dans Storage : {chemin_image}")
+        return False
+    with Image.open(io.BytesIO(octets)) as image:
+        ImageOps.exif_transpose(image).convert("RGB").save(FICHIER_RESULTAT, format="PNG", optimize=True)
 
-    # 1. Publication Facebook
-    resultat_fb = publier_sur_facebook(texte_post, FICHIER_RESULTAT)
-    succes_fb = "error" not in resultat_fb
-    fb_post_id = resultat_fb.get("post_id") or resultat_fb.get("id") if succes_fb else None
+    image_publique_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{quote(chemin_image, safe='/')}"
+    texte = str(action.get("texte_genere") or "")
 
-    if succes_fb:
-        print(f"🎉 Publication Facebook réussie ! ID : {fb_post_id}")
-    else:
-        print("❌ Échec Facebook :", resultat_fb)
+    resultat_fb = publier_sur_facebook(texte, FICHIER_RESULTAT)
+    succes_fb = bool(resultat_fb.get("id") or resultat_fb.get("post_id")) and "error" not in resultat_fb
+    id_fb = resultat_fb.get("post_id") or resultat_fb.get("id")
+    print(("🎉 Facebook publié : " + str(id_fb)) if succes_fb else ("❌ Échec Facebook : " + json.dumps(resultat_fb, ensure_ascii=False)[:1200]))
 
-    # 2. Publication Instagram
-    resultat_ig = publier_sur_instagram(texte_post, image_publique_url)
-    succes_ig = "error" not in resultat_ig
-    ig_post_id = resultat_ig.get("id") if succes_ig else None
-
-    if succes_ig:
-        print(f"🎉 Publication Instagram réussie ! ID : {ig_post_id}")
-    else:
-        print("❌ Échec Instagram :", resultat_ig)
+    resultat_ig = publier_sur_instagram(texte, image_publique_url)
+    succes_ig = bool(resultat_ig.get("id")) and "error" not in resultat_ig
+    id_ig = resultat_ig.get("id")
+    print(("🎉 Instagram publié : " + str(id_ig)) if succes_ig else ("❌ Échec Instagram : " + json.dumps(resultat_ig, ensure_ascii=False)[:1200]))
 
     if succes_fb or succes_ig:
-        supabase.table("historique_publications").update({"statut": "termine"}).eq("id", derniere_action["id"]).execute()
-        nettoyer_image_storage(derniere_action.get("image_path"))
+        supabase.table("historique_publications").update({
+            "statut": "termine",
+        }).eq("id", action["id"]).execute()
 
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        msg_recap = f"🎉 Publication réussie !\n📘 Facebook: {'✅' if succes_fb else '❌'}\n📸 Instagram: {'✅' if succes_ig else '❌'}"
-        asyncio.run(
-            bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg_recap,
-            )
-        )
+        # Ne supprime l'image qu'après la tentative Instagram, qui doit pouvoir la télécharger.
+        nettoyer_image_storage(chemin_image)
+
+        try:
+            bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            recap = f"Publication terminée.\nFacebook : {'OK' if succes_fb else 'ÉCHEC'}\nInstagram : {'OK' if succes_ig else 'ÉCHEC'}"
+            asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=recap))
+        except Exception as exc:
+            print(f"⚠️ Envoi du récapitulatif Telegram impossible : {exc}")
         return True
-    else:
-        print("❌ Échec global des publications Facebook et Instagram.")
-        return False
+
+    print("❌ Les deux plateformes ont échoué ; l'image est conservée pour diagnostic.")
+    return False
+
+
+def creer_et_envoyer_proposition():
+    texte, image_locale, _ = generer_nouveau_contenu()
+    asyncio.run(envoyer_vers_telegram(texte, image_locale))
 
 
 def main():
-    print("🔍 Récupération de la dernière publication dans Supabase...")
-
+    verifier_configuration()
+    print("🔍 Recherche de la dernière proposition Supabase…")
     historique = (
         supabase.table("historique_publications")
         .select("*")
@@ -525,70 +600,59 @@ def main():
         .limit(1)
         .execute()
         .data
+        or []
     )
-
     if not historique:
-        print("ℹ️ Aucune publication trouvée dans la table. Lancement du premier cycle créatif...")
-        texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-        asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
+        print("ℹ️ Aucun historique : création de la première proposition.")
+        creer_et_envoyer_proposition()
         return
 
-    derniere_action = historique[0]
-    statut_actuel = derniere_action.get("statut", "termine")
-
-    created_at_str = derniere_action.get("created_at")
-    date_creation_utc = None
-    if created_at_str:
+    action = historique[0]
+    statut = str(action.get("statut") or "termine")
+    date_creation = None
+    created_at = action.get("created_at")
+    if created_at:
         try:
-            dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-            date_creation_utc = int(dt.timestamp())
-        except Exception as e:
-            print(f"⚠️ Erreur parsing date created_at : {e}")
+            date_creation = int(datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp())
+        except Exception as exc:
+            print(f"⚠️ created_at illisible : {exc}")
 
-    print(f"📊 Statut actuel trouvé dans Supabase : {statut_actuel} (Créé à timestamp: {date_creation_utc})")
+    print(f"📊 Statut : {statut} | created_at timestamp : {date_creation}")
 
-    if statut_actuel == "en_attente":
-        reponse = verifier_reponse_telegram_securisee(date_creation_utc)
-        print(f"💬 Réponse Telegram détectée : '{reponse}'")
-
+    if statut == "en_attente":
+        reponse = verifier_reponse_telegram_securisee(date_creation)
+        print(f"💬 Réponse Telegram : {reponse or '(aucune)'}")
+        if reponse == "non":
+            supabase.table("historique_publications").update({"statut": "annule"}).eq("id", action["id"]).execute()
+            nettoyer_image_storage(action.get("image_path"))
+            creer_et_envoyer_proposition()
+            return
         if reponse == "oui":
-            if verifier_plage_horaire():
-                print("🚀 'oui' valide + DANS la plage horaire ! Publication immédiate...")
-                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
-                if executer_publication_facebook_et_instagram(derniere_action):
-                    texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-                    asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
-            else:
-                print("⏳ 'oui' valide mais HORS plage horaire ! Passage à 'valide' en attente de l'heure.")
-                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", derniere_action["id"]).execute()
-
-        elif reponse == "non":
-            print("❌ 'non' valide reçu ! Passage à 'annule', nettoyage du Storage et relance d'un nouveau cycle...")
-            supabase.table("historique_publications").update({"statut": "annule"}).eq("id", derniere_action["id"]).execute()
-            nettoyer_image_storage(derniere_action.get("image_path"))
-            texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-            asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
-
-        else:
-            print("🛑 Aucune réponse récente détectée sur Telegram. Le script s'arrête gentiment sans rien toucher.")
+            if not verifier_plage_horaire():
+                supabase.table("historique_publications").update({"statut": "valide"}).eq("id", action["id"]).execute()
+                print("⏳ Proposition validée ; elle sera publiée quand le script sera relancé pendant la plage autorisée.")
+                return
+            supabase.table("historique_publications").update({"statut": "valide"}).eq("id", action["id"]).execute()
+            action["statut"] = "valide"
+            if executer_publication_facebook_et_instagram(action):
+                creer_et_envoyer_proposition()
             return
-
-    elif statut_actuel == "valide":
-        print("🔍 Post déjà validé. Vérification directe de la plage horaire...")
-        if verifier_plage_horaire():
-            print("🚀 Dans la plage horaire ! Publication et relance d'un nouveau cycle...")
-            if executer_publication_facebook_et_instagram(derniere_action):
-                texte_nouveau, image_nouveau, _ = generer_nouveau_contenu()
-                asyncio.run(envoyer_vers_telegram(texte_nouveau, image_nouveau))
-        else:
-            print("⏸️ Hors de la plage horaire. Le script s'arrête en conservant le statut 'valide'.")
-            return
-
-    elif statut_actuel in ["annule", "termine"]:
-        print("ℹ️ La dernière publication est déjà terminée ou annulée. Rien à publier.")
+        print("🛑 Aucune réponse récente : aucune action.")
         return
 
-    print("\n✅ Script exécuté avec succès et terminé !")
+    if statut == "valide":
+        if verifier_plage_horaire():
+            if executer_publication_facebook_et_instagram(action):
+                creer_et_envoyer_proposition()
+        else:
+            print("⏸️ Hors plage horaire : proposition conservée au statut valide.")
+        return
+
+    if statut in ("annule", "termine"):
+        print("ℹ️ Dernière proposition déjà annulée ou terminée. Rien à faire.")
+        return
+
+    print(f"⚠️ Statut non reconnu : {statut}. Aucune action automatique.")
 
 
 if __name__ == "__main__":
