@@ -4,6 +4,7 @@ import io
 import json
 import os
 import random
+import time
 import requests
 from datetime import datetime, timezone
 from PIL import Image
@@ -47,9 +48,9 @@ PAGE_ACCESS_TOKEN = lire_table_supabase("table_token_facebook", "valeur")
 TELEGRAM_BOT_TOKEN = lire_table_supabase("table_telegram_token", "valeur")
 TELEGRAM_CHAT_ID = lire_table_supabase("table_telegram_chat_id", "valeur")
 
-# Récupération dynamique de l'ID de la page Facebook et de l'ID Instagram Business
+# Récupération dynamique de l'ID de la page Facebook et de l'ID Instagram Business (Corrigé)
 PAGE_ID = lire_table_supabase("table_page_id", "valeur") or lire_table_supabase("table_page_id", "page_id") or "111157353629841"
-INSTAGRAM_BUSINESS_ID = lire_table_supabase("instagram_config", "valeur") or lire_table_supabase("instagram_config", "instagram_business_id") or "17841451463230647"
+INSTAGRAM_BUSINESS_ID = lire_table_supabase("instagram_config", "instagram_business_id") or lire_table_supabase("instagram_config", "valeur") or "17841451463230647"
 
 PROMPTIX_URL = "https://promptix.tn/api/v1/chat/completions"
 
@@ -115,7 +116,6 @@ def verifier_reponse_telegram_securisee(date_creation_post_utc):
                     texte_msg = message.get("text", "").strip().lower()
 
                     if msg_timestamp and date_creation_post_utc:
-                        # Vérification que le message est plus récent que la création du post
                         if msg_timestamp > date_creation_post_utc:
                             if texte_msg in ["oui", "valider"]:
                                 print(f"🟢 'oui' VALIDE reçu sur Telegram (Envoyé à {msg_timestamp} > Créé à {date_creation_post_utc})")
@@ -452,6 +452,10 @@ def publier_sur_instagram(texte, image_url):
     creation_id = res_container_json["id"]
     print(f"🔹 Conteneur Instagram créé (ID: {creation_id})")
 
+    # ⏱️ Pause de sécurité pour laisser le temps à Meta de télécharger l'image
+    print("⏳ Patientons 10 secondes pour que l'image soit prête chez Meta...")
+    time.sleep(10)
+
     publish_endpoint = f"{BASE_GRAPH_URL}/{INSTAGRAM_BUSINESS_ID}/media_publish"
     publish_payload = {
         "creation_id": creation_id,
@@ -532,12 +536,10 @@ def main():
     derniere_action = historique[0]
     statut_actuel = derniere_action.get("statut", "termine")
 
-    # Extraire et convertir le timestamp de création de la publication
     created_at_str = derniere_action.get("created_at")
     date_creation_utc = None
     if created_at_str:
         try:
-            # Conversion ISO 8601 (ex: "2026-10-13T16:10:00+00:00") en timestamp UNIX
             dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
             date_creation_utc = int(dt.timestamp())
         except Exception as e:
@@ -545,9 +547,6 @@ def main():
 
     print(f"📊 Statut actuel trouvé dans Supabase : {statut_actuel} (Créé à timestamp: {date_creation_utc})")
 
-    # =========================================================================
-    # 1. SI STATUT EST "en_attente"
-    # =========================================================================
     if statut_actuel == "en_attente":
         reponse = verifier_reponse_telegram_securisee(date_creation_utc)
         print(f"💬 Réponse Telegram détectée : '{reponse}'")
@@ -574,9 +573,6 @@ def main():
             print("🛑 Aucune réponse récente détectée sur Telegram. Le script s'arrête gentiment sans rien toucher.")
             return
 
-    # =========================================================================
-    # 2. SI STATUT EST "valide"
-    # =========================================================================
     elif statut_actuel == "valide":
         print("🔍 Post déjà validé. Vérification directe de la plage horaire...")
         if verifier_plage_horaire():
@@ -588,9 +584,6 @@ def main():
             print("⏸️ Hors de la plage horaire. Le script s'arrête en conservant le statut 'valide'.")
             return
 
-    # =========================================================================
-    # 3. SI STATUT EST "annule" OU "termine"
-    # =========================================================================
     elif statut_actuel in ["annule", "termine"]:
         print("ℹ️ La dernière publication est déjà terminée ou annulée. Rien à publier.")
         return
